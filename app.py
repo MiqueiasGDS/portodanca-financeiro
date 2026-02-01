@@ -1,7 +1,8 @@
 import streamlit as st
 import re
+import sqlite3
 import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 import google.generativeai as genai
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
@@ -10,36 +11,15 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib.units import cm
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 import io
-import os
-import psycopg2
-from psycopg2.extras import RealDictCursor
 
 # ==================== CONFIGURAÇÕES ====================
-
-# Timezone de Brasília (UTC-3)
-BRASILIA_TZ = timezone(timedelta(hours=-3))
-
-def agora_brasilia():
-    """Retorna datetime atual em horário de Brasília"""
-    return datetime.now(BRASILIA_TZ)
-
-def converter_para_brasilia(dt_utc):
-    """Converte datetime UTC para Brasília"""
-    if isinstance(dt_utc, str):
-        dt_utc = datetime.fromisoformat(dt_utc.replace('Z', '+00:00'))
-    if dt_utc.tzinfo is None:
-        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
-    return dt_utc.astimezone(BRASILIA_TZ)
 
 # Gemini API
 genai.configure(api_key="AIzaSyDtDbM0Hg4jbWT9CdzQSCEY_s_1EG5vGg0")
 model = genai.GenerativeModel('gemini-2.5-flash')
 
-# Código de acesso
-CODIGO_ACESSO = os.getenv("CODIGO_ACESSO", "PORTO2026")
-
-# Conexão PostgreSQL
-DATABASE_URL = os.getenv("DATABASE_URL")
+# Código de acesso (ALTERE AQUI)
+CODIGO_ACESSO = "PORTO2026"
 
 # Orçamento do projeto
 ORCAMENTO = {
@@ -53,47 +33,42 @@ ORCAMENTO_TOTAL = 190000.00
 
 # ==================== BANCO DE DADOS ====================
 
-def get_db_connection():
-    """Cria conexão com PostgreSQL"""
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-
 def init_db():
-    """Inicializa tabelas no PostgreSQL"""
-    conn = get_db_connection()
+    conn = sqlite3.connect('portodanca.db')
     c = conn.cursor()
     
     # Tabela de gastos
     c.execute('''CREATE TABLE IF NOT EXISTS gastos
-                 (id SERIAL PRIMARY KEY,
-                  data TIMESTAMP,
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  data TEXT,
                   descricao TEXT,
-                  valor DECIMAL(10,2),
+                  valor REAL,
                   categoria TEXT,
-                  data_registro TIMESTAMP,
+                  data_registro TEXT,
                   informado_por TEXT,
-                  message_id BIGINT)''')
+                  message_id INTEGER)''')
     
     # Tabela para mensagens do Telegram
     c.execute('''CREATE TABLE IF NOT EXISTS mensagens_telegram
-                 (id SERIAL PRIMARY KEY,
-                  message_id BIGINT UNIQUE,
-                  chat_id BIGINT,
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  message_id INTEGER UNIQUE,
+                  chat_id INTEGER,
                   user_name TEXT,
-                  user_id BIGINT,
+                  user_id INTEGER,
                   texto TEXT,
-                  data_mensagem TIMESTAMP,
+                  data_mensagem TEXT,
                   processado INTEGER DEFAULT 0)''')
     
     # Tabela para controlar última sincronização
     c.execute('''CREATE TABLE IF NOT EXISTS sync_control
                  (id INTEGER PRIMARY KEY,
-                  ultima_sync TIMESTAMP)''')
+                  ultima_sync TEXT)''')
     
     # Inicializar sync_control se vazio
-    c.execute('SELECT COUNT(*) as count FROM sync_control')
-    if c.fetchone()['count'] == 0:
-        c.execute('INSERT INTO sync_control (id, ultima_sync) VALUES (1, %s)', 
-                 (datetime(2020, 1, 1, tzinfo=timezone.utc),))
+    c.execute('SELECT COUNT(*) FROM sync_control')
+    if c.fetchone()[0] == 0:
+        c.execute('INSERT INTO sync_control (id, ultima_sync) VALUES (1, ?)', 
+                 (datetime(2020, 1, 1).isoformat(),))
     
     conn.commit()
     conn.close()
@@ -102,6 +77,12 @@ def init_db():
 
 def extrair_gastos_telegram(texto, user_name):
     """Extrai valor, quantidade e descrição de mensagens do Telegram"""
+    # Padrões comuns:
+    # "R$ 500,00 para impressão de 1000 folders"
+    # "Paguei 300 reais, 5 unidades de camisetas"
+    # "Valor: R$ 1.500,00 - Locação de som"
+    
+    # Extrair valor
     padrao_valor = r'R\$?\s*(\d{1,3}(?:\.\d{3})*(?:,\d{2})?)|(\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*reais?'
     match_valor = re.search(padrao_valor, texto, re.IGNORECASE)
     
@@ -112,13 +93,15 @@ def extrair_gastos_telegram(texto, user_name):
     valor_str = valor_str.replace('.', '').replace(',', '.')
     valor_unitario = float(valor_str)
     
+    # Extrair quantidade (opcional)
     padrao_qtd = r'(\d+)\s*(?:unidade|unid|un|peça|peças|itens?|x)'
     match_qtd = re.search(padrao_qtd, texto, re.IGNORECASE)
     
     quantidade = int(match_qtd.group(1)) if match_qtd else 1
     valor_total = valor_unitario * quantidade
     
-    descricao = texto[:200]
+    # Descrição é o texto completo
+    descricao = texto[:200]  # Limitar tamanho
     
     return {
         'descricao': descricao,
@@ -135,22 +118,11 @@ def categorizar_gastos_telegram(gastos):
     
     categorias = list(ORCAMENTO.keys())
     
-    # Converter datetime para string antes de serializar
-    gastos_limpos = []
-    for gasto in gastos:
-        gasto_limpo = {}
-        for key, value in gasto.items():
-            if isinstance(value, datetime):
-                gasto_limpo[key] = value.isoformat()
-            else:
-                gasto_limpo[key] = value
-        gastos_limpos.append(gasto_limpo)
-    
     prompt = f"""Você é um assistente financeiro. Analise cada gasto abaixo e categorize-o em UMA das seguintes categorias:
 {', '.join(categorias)}
 
 Gastos para categorizar:
-{json.dumps(gastos_limpos, ensure_ascii=False, indent=2)}
+{json.dumps(gastos, ensure_ascii=False, indent=2)}
 
 Responda APENAS com um JSON no formato:
 [
@@ -181,19 +153,19 @@ IMPORTANTE:
 
 def sincronizar_telegram():
     """Busca novas mensagens do Telegram e processa"""
-    conn = get_db_connection()
+    conn = sqlite3.connect('portodanca.db')
     c = conn.cursor()
     
     # Pegar última sincronização
     c.execute('SELECT ultima_sync FROM sync_control WHERE id = 1')
     result = c.fetchone()
-    ultima_sync = result['ultima_sync'] if result else datetime(2020, 1, 1, tzinfo=timezone.utc)
+    ultima_sync = datetime.fromisoformat(result[0]) if result else datetime(2020, 1, 1)
     
     # Buscar mensagens não processadas desde última sync
     c.execute('''SELECT id, message_id, user_name, texto, data_mensagem 
                  FROM mensagens_telegram 
-                 WHERE processado = 0 AND data_mensagem > %s
-                 ORDER BY data_mensagem''', (ultima_sync,))
+                 WHERE processado = 0 AND data_mensagem > ?
+                 ORDER BY data_mensagem''', (ultima_sync.isoformat(),))
     
     mensagens = c.fetchall()
     conn.close()
@@ -203,12 +175,12 @@ def sincronizar_telegram():
     
     # Extrair gastos de cada mensagem
     gastos_brutos = []
-    for msg in mensagens:
-        gasto = extrair_gastos_telegram(msg['texto'], msg['user_name'])
+    for msg_id, message_id, user_name, texto, data_msg in mensagens:
+        gasto = extrair_gastos_telegram(texto, user_name)
         if gasto:
-            gasto['message_id'] = msg['message_id']
-            gasto['msg_db_id'] = msg['id']
-            gasto['data_mensagem'] = msg['data_mensagem']
+            gasto['message_id'] = message_id
+            gasto['msg_db_id'] = msg_id
+            gasto['data_mensagem'] = data_msg
             gastos_brutos.append(gasto)
     
     if not gastos_brutos:
@@ -229,22 +201,14 @@ def sincronizar_telegram():
 # ==================== OPERAÇÕES DE GASTOS ====================
 
 def salvar_gastos(gastos):
-    conn = get_db_connection()
+    conn = sqlite3.connect('portodanca.db')
     c = conn.cursor()
-    data_registro = agora_brasilia()
+    data_registro = datetime.now().isoformat()
     
     for gasto in gastos:
-        # Converter data da mensagem para Brasília
-        data_msg = gasto.get('data_mensagem', agora_brasilia())
-        if isinstance(data_msg, str):
-            data_msg = datetime.fromisoformat(data_msg.replace('Z', '+00:00'))
-        if data_msg.tzinfo is None:
-            data_msg = data_msg.replace(tzinfo=timezone.utc)
-        data_msg_br = data_msg.astimezone(BRASILIA_TZ)
-        
         c.execute('''INSERT INTO gastos (data, descricao, valor, categoria, data_registro, informado_por, message_id)
-                     VALUES (%s, %s, %s, %s, %s, %s, %s)''',
-                  (data_msg_br, 
+                     VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                  (gasto.get('data_mensagem', datetime.now().isoformat())[:10], 
                    gasto['descricao'], 
                    gasto['valor'], 
                    gasto['categoria'],
@@ -254,45 +218,39 @@ def salvar_gastos(gastos):
         
         # Marcar mensagem como processada
         if 'msg_db_id' in gasto:
-            c.execute('UPDATE mensagens_telegram SET processado = 1 WHERE id = %s', 
+            c.execute('UPDATE mensagens_telegram SET processado = 1 WHERE id = ?', 
                      (gasto['msg_db_id'],))
     
     # Atualizar última sincronização
-    c.execute('UPDATE sync_control SET ultima_sync = %s WHERE id = 1', 
-             (agora_brasilia(),))
+    c.execute('UPDATE sync_control SET ultima_sync = ? WHERE id = 1', 
+             (datetime.now().isoformat(),))
     
     conn.commit()
     conn.close()
 
 def carregar_gastos():
-    conn = get_db_connection()
+    conn = sqlite3.connect('portodanca.db')
     c = conn.cursor()
     c.execute('''SELECT id, data, descricao, valor, categoria, informado_por, message_id
                  FROM gastos ORDER BY data DESC''')
     gastos = []
     for row in c.fetchall():
-        # Converter data para Brasília se necessário
-        data_gasto = row['data']
-        if data_gasto.tzinfo is None:
-            data_gasto = data_gasto.replace(tzinfo=timezone.utc)
-        data_br = data_gasto.astimezone(BRASILIA_TZ)
-        
         gastos.append({
-            'id': row['id'],
-            'data': data_br.strftime('%Y-%m-%d %H:%M'),
-            'descricao': row['descricao'],
-            'valor': float(row['valor']),
-            'categoria': row['categoria'],
-            'informado_por': row['informado_por'] or 'N/A',
-            'message_id': row['message_id']
+            'id': row[0],
+            'data': row[1],
+            'descricao': row[2],
+            'valor': row[3],
+            'categoria': row[4],
+            'informado_por': row[5] or 'N/A',
+            'message_id': row[6]
         })
     conn.close()
     return gastos
 
 def deletar_gasto(gasto_id):
-    conn = get_db_connection()
+    conn = sqlite3.connect('portodanca.db')
     c = conn.cursor()
-    c.execute('DELETE FROM gastos WHERE id = %s', (gasto_id,))
+    c.execute('DELETE FROM gastos WHERE id = ?', (gasto_id,))
     conn.commit()
     conn.close()
 
@@ -318,6 +276,7 @@ def gerar_pdf_balanco():
     elements = []
     styles = getSampleStyleSheet()
     
+    # Título
     title_style = ParagraphStyle(
         'CustomTitle',
         parent=styles['Heading1'],
@@ -331,10 +290,12 @@ def gerar_pdf_balanco():
     elements.append(Paragraph("Relatório Financeiro Detalhado", styles['Heading2']))
     elements.append(Spacer(1, 0.5*cm))
     
-    data_relatorio = agora_brasilia().strftime("%d/%m/%Y às %H:%M")
-    elements.append(Paragraph(f"Gerado em: {data_relatorio} (Horário de Brasília)", styles['Normal']))
+    # Data do relatório
+    data_relatorio = datetime.now().strftime("%d/%m/%Y às %H:%M")
+    elements.append(Paragraph(f"Gerado em: {data_relatorio}", styles['Normal']))
     elements.append(Spacer(1, 1*cm))
     
+    # Resumo geral
     totais_por_categoria, total_gasto = calcular_balanco()
     saldo = ORCAMENTO_TOTAL - total_gasto
     percentual = (total_gasto / ORCAMENTO_TOTAL) * 100
@@ -363,6 +324,7 @@ def gerar_pdf_balanco():
     elements.append(resumo_table)
     elements.append(Spacer(1, 1*cm))
     
+    # Detalhamento por categoria
     elements.append(Paragraph("Detalhamento por Categoria", styles['Heading2']))
     elements.append(Spacer(1, 0.5*cm))
     
@@ -396,6 +358,7 @@ def gerar_pdf_balanco():
     elements.append(cat_table)
     elements.append(Spacer(1, 1*cm))
     
+    # Lista de gastos
     elements.append(Paragraph("Registro de Gastos", styles['Heading2']))
     elements.append(Spacer(1, 0.5*cm))
     
@@ -403,9 +366,9 @@ def gerar_pdf_balanco():
     
     gastos_data = [['Data', 'Descrição', 'Valor', 'Categoria', 'Informado por']]
     
-    for gasto in gastos[:50]:
+    for gasto in gastos[:50]:  # Limitar a 50 gastos para não ficar muito grande
         gastos_data.append([
-            gasto['data'][:10],
+            gasto['data'],
             gasto['descricao'][:30] + '...' if len(gasto['descricao']) > 30 else gasto['descricao'],
             f"R$ {gasto['valor']:.2f}",
             gasto['categoria'][:15],
@@ -522,7 +485,7 @@ def main():
             st.download_button(
                 label="📄 Baixar Relatório PDF",
                 data=pdf_buffer,
-                file_name=f"balanco_portodanca_{agora_brasilia().strftime('%Y%m%d')}.pdf",
+                file_name=f"balanco_portodanca_{datetime.now().strftime('%Y%m%d')}.pdf",
                 mime="application/pdf",
                 use_container_width=True
             )
@@ -561,26 +524,26 @@ def main():
         col1, col2 = st.columns(2)
         
         with col1:
-            conn = get_db_connection()
+            conn = sqlite3.connect('portodanca.db')
             c = conn.cursor()
-            c.execute('SELECT COUNT(*) as count FROM mensagens_telegram WHERE processado = 0')
-            nao_processadas = c.fetchone()['count']
-            c.execute('SELECT COUNT(*) as count FROM mensagens_telegram')
-            total_msgs = c.fetchone()['count']
+            c.execute('SELECT COUNT(*) FROM mensagens_telegram WHERE processado = 0')
+            nao_processadas = c.fetchone()[0]
+            c.execute('SELECT COUNT(*) FROM mensagens_telegram')
+            total_msgs = c.fetchone()[0]
             conn.close()
             
             st.metric("Mensagens Não Processadas", nao_processadas)
             st.metric("Total de Mensagens", total_msgs)
         
         with col2:
-            conn = get_db_connection()
+            conn = sqlite3.connect('portodanca.db')
             c = conn.cursor()
             c.execute('SELECT ultima_sync FROM sync_control WHERE id = 1')
             result = c.fetchone()
             conn.close()
             
             if result:
-                ultima = converter_para_brasilia(result['ultima_sync'])
+                ultima = datetime.fromisoformat(result[0])
                 st.metric("Última Sincronização", ultima.strftime("%d/%m/%Y %H:%M"))
         
         st.divider()
@@ -640,13 +603,7 @@ def main():
                         )
                         
                         if 'data_mensagem' in gasto:
-                            data_msg = gasto['data_mensagem']
-                            if isinstance(data_msg, str):
-                                data_msg = datetime.fromisoformat(data_msg.replace('Z', '+00:00'))
-                            if data_msg.tzinfo is None:
-                                data_msg = data_msg.replace(tzinfo=timezone.utc)
-                            data_br = data_msg.astimezone(BRASILIA_TZ)
-                            st.caption(f"📅 Data: {data_br.strftime('%d/%m/%Y %H:%M')}")
+                            st.caption(f"📅 Data: {gasto['data_mensagem'][:10]}")
                     
                     gastos_revisados.append({
                         'descricao': nova_descricao,
@@ -655,7 +612,7 @@ def main():
                         'informado_por': informado_por,
                         'message_id': gasto.get('message_id'),
                         'msg_db_id': gasto.get('msg_db_id'),
-                        'data_mensagem': gasto.get('data_mensagem', agora_brasilia())
+                        'data_mensagem': gasto.get('data_mensagem', datetime.now().isoformat())
                     })
             
             st.divider()
@@ -688,7 +645,7 @@ def main():
                     col1, col2, col3, col4, col5, col6 = st.columns([1.5, 3, 1.5, 2, 2, 0.7])
                     
                     with col1:
-                        st.write(gasto['data'][:10])
+                        st.write(gasto['data'])
                     with col2:
                         st.write(gasto['descricao'][:40] + "...")
                     with col3:
