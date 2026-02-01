@@ -135,11 +135,22 @@ def categorizar_gastos_telegram(gastos):
     
     categorias = list(ORCAMENTO.keys())
     
+    # Converter datetime para string antes de serializar
+    gastos_limpos = []
+    for gasto in gastos:
+        gasto_limpo = {}
+        for key, value in gasto.items():
+            if isinstance(value, datetime):
+                gasto_limpo[key] = value.isoformat()
+            else:
+                gasto_limpo[key] = value
+        gastos_limpos.append(gasto_limpo)
+    
     prompt = f"""Você é um assistente financeiro. Analise cada gasto abaixo e categorize-o em UMA das seguintes categorias:
 {', '.join(categorias)}
 
 Gastos para categorizar:
-{json.dumps(gastos, ensure_ascii=False, indent=2)}
+{json.dumps(gastos_limpos, ensure_ascii=False, indent=2)}
 
 Responda APENAS com um JSON no formato:
 [
