@@ -1,12 +1,13 @@
 import os
 import sqlite3
+import asyncio
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
-# Configurações (você vai preencher depois)
-TELEGRAM_TOKEN = "7429389061:AAErON4twe7gqCbCD6hQJOWLv7bVyvucJ0c"  # Pegar com @BotFather
-TELEGRAM_CHAT_ID = -5146309494  # ID do grupo
+# Configurações - Pegar das variáveis de ambiente
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "SEU_TOKEN_AQUI")
+TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "-1234567890"))
 
 # Inicializar banco de dados
 def init_db():
@@ -24,7 +25,7 @@ def init_db():
                   data_mensagem TEXT,
                   processado INTEGER DEFAULT 0)''')
     
-    # Tabela de gastos (já existe, mas vou adicionar campos)
+    # Tabela de gastos
     c.execute('''CREATE TABLE IF NOT EXISTS gastos
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   data TEXT,
@@ -51,6 +52,10 @@ async def salvar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if message.chat.id != TELEGRAM_CHAT_ID:
         return
     
+    # Só processar mensagens de texto
+    if not message.text:
+        return
+    
     conn = sqlite3.connect('portodanca.db')
     c = conn.cursor()
     
@@ -75,14 +80,18 @@ async def salvar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except sqlite3.IntegrityError:
         # Mensagem já existe
         pass
+    except Exception as e:
+        print(f"❌ Erro ao salvar mensagem: {e}")
     
     conn.close()
 
 # Rodar bot
-def main():
+async def main():
     init_db()
     
     print("🤖 Iniciando bot do Telegram...")
+    print(f"📡 Token configurado: {TELEGRAM_TOKEN[:10]}...")
+    print(f"📱 Chat ID: {TELEGRAM_CHAT_ID}")
     
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     
@@ -90,7 +99,15 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, salvar_mensagem))
     
     print("✅ Bot rodando! Aguardando mensagens...")
-    app.run_polling()
+    
+    # Rodar com polling
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    
+    # Manter rodando
+    while True:
+        await asyncio.sleep(1)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
