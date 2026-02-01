@@ -1,58 +1,45 @@
 import os
+import sqlite3
 import asyncio
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
-import psycopg2
-from psycopg2.extras import RealDictCursor
-
-# Timezone de Brasília (UTC-3)
-BRASILIA_TZ = timezone(timedelta(hours=-3))
-
-def agora_brasilia():
-    """Retorna datetime atual em horário de Brasília"""
-    return datetime.now(BRASILIA_TZ)
 
 # Configurações - Pegar das variáveis de ambiente
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "SEU_TOKEN_AQUI")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "-1234567890"))
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-def get_db_connection():
-    """Cria conexão com PostgreSQL"""
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 # Inicializar banco de dados
 def init_db():
-    conn = get_db_connection()
+    conn = sqlite3.connect('portodanca.db')
     c = conn.cursor()
     
     # Tabela para mensagens do Telegram
     c.execute('''CREATE TABLE IF NOT EXISTS mensagens_telegram
-                 (id SERIAL PRIMARY KEY,
-                  message_id BIGINT UNIQUE,
-                  chat_id BIGINT,
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  message_id INTEGER UNIQUE,
+                  chat_id INTEGER,
                   user_name TEXT,
-                  user_id BIGINT,
+                  user_id INTEGER,
                   texto TEXT,
-                  data_mensagem TIMESTAMP,
+                  data_mensagem TEXT,
                   processado INTEGER DEFAULT 0)''')
     
     # Tabela de gastos
     c.execute('''CREATE TABLE IF NOT EXISTS gastos
-                 (id SERIAL PRIMARY KEY,
-                  data TIMESTAMP,
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  data TEXT,
                   descricao TEXT,
-                  valor DECIMAL(10,2),
+                  valor REAL,
                   categoria TEXT,
-                  data_registro TIMESTAMP,
+                  data_registro TEXT,
                   informado_por TEXT,
-                  message_id BIGINT)''')
+                  message_id INTEGER)''')
     
     # Tabela para controlar última sincronização
     c.execute('''CREATE TABLE IF NOT EXISTS sync_control
                  (id INTEGER PRIMARY KEY,
-                  ultima_sync TIMESTAMP)''')
+                  ultima_sync TEXT)''')
     
     conn.commit()
     conn.close()
@@ -69,36 +56,32 @@ async def salvar_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message.text:
         return
     
-    conn = get_db_connection()
+    conn = sqlite3.connect('portodanca.db')
     c = conn.cursor()
     
     user_name = message.from_user.first_name
     if message.from_user.last_name:
         user_name += f" {message.from_user.last_name}"
     
-    # Converter data da mensagem para Brasília
-    data_msg_utc = message.date
-    if data_msg_utc.tzinfo is None:
-        data_msg_utc = data_msg_utc.replace(tzinfo=timezone.utc)
-    data_msg_br = data_msg_utc.astimezone(BRASILIA_TZ)
-    
     try:
         c.execute('''INSERT INTO mensagens_telegram 
                      (message_id, chat_id, user_name, user_id, texto, data_mensagem)
-                     VALUES (%s, %s, %s, %s, %s, %s)''',
+                     VALUES (?, ?, ?, ?, ?, ?)''',
                   (message.message_id,
                    message.chat.id,
                    user_name,
                    message.from_user.id,
                    message.text,
-                   data_msg_br))
+                   message.date.isoformat()))
         
         conn.commit()
-        print(f"✅ Mensagem salva [{data_msg_br.strftime('%d/%m/%Y %H:%M')}]: {user_name} - {message.text[:50]}")
+        print(f"✅ Mensagem salva: {user_name} - {message.text[:50]}")
         
+    except sqlite3.IntegrityError:
+        # Mensagem já existe
+        pass
     except Exception as e:
-        if 'duplicate key' not in str(e).lower():
-            print(f"❌ Erro ao salvar mensagem: {e}")
+        print(f"❌ Erro ao salvar mensagem: {e}")
     
     conn.close()
 
@@ -109,8 +92,6 @@ async def main():
     print("🤖 Iniciando bot do Telegram...")
     print(f"📡 Token configurado: {TELEGRAM_TOKEN[:10]}...")
     print(f"📱 Chat ID: {TELEGRAM_CHAT_ID}")
-    print(f"🕐 Timezone: Brasília (UTC-3)")
-    print(f"🕒 Hora atual: {agora_brasilia().strftime('%d/%m/%Y %H:%M:%S')}")
     
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     
